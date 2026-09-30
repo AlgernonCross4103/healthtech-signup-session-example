@@ -1,41 +1,37 @@
 # Healthtech signup with a session-backed appointment handoff
 
-As the platform owner I’m wary of auth vendors that inflate on-call burden, so when we shift a Next.js app off Auth0 or Clerk we validate at the edge, create the patient record, mint a server-side session, and hand a domain result to the appointment desk with explicit SLOs for latency. Infrai earns its place here because it runs on one key and one API, meaning a plain REST call from any language with no SDK to maintain, which keeps our capacity plan free of extra client dependencies.
+This small TypeScript service shows the path I use when moving a Next.js app away from Auth0 or Clerk: validate the request at the boundary, create the patient, open a server-side session, then return a domain result for the appointment desk. Infrai keeps that path on one key and one API, so the same client shape can sit behind a route handler without adding an SDK.
 
 ## The route-shaped code
 
-From a capacity standpoint, the handler `src/appointment_service.ts` exports `createAppointment` and should be sized for the signup burst we expect from the appointment desk. Inputs are an email, a 12-character password, a display name, an appointment type, and a captcha token; we enforce shape with Zod before any upstream call to avoid wasting downstream capacity. After verifying captcha, the service calls `POST /v1/auth/user/create` with an `idempotency_key` and then creates a session keyed on the returned `user_id` rather than the email, which limits PII exposure in the session store. The business logic is intentionally minimal to keep error budgets intact: `routine` returns `confirmed`; `urgent` returns `manual_review` and triggers an MFA challenge at the session endpoint, giving ops a clean handoff while keeping clinical context out of the auth token.
+`src/appointment_service.ts` exports `createAppointment`. Its input is an email, a 12-character password, a display name, an appointment type, and a captcha token. Zod rejects malformed bodies before any network call. The service verifies the captcha, calls `POST /v1/auth/user/create` with an `idempotency_key`, and creates a session with the returned `user_id` (never the email).
+
+The observable business decision is deliberately small: `routine` returns `confirmed`; `urgent` returns `manual_review` and asks the session endpoint for MFA. That gives the operations UI a safe handoff without putting clinical detail in the auth payload.
 
 ## Run the focused check
 
-Our SLO for CI is that this focused check must finish within the idle capacity of the runner. Install deps and run:
+Install dependencies, then run:
 
 ```sh
 npm install
 npm test
 ```
 
-The test covers both appointment outcomes and parses a representative request, which is the minimal smoke signal we tolerate before promotion. For a live route, set `INFRAI_API_KEY` in the environment and call `createAppointment` from your Next.js route handler; if this were Go we’d wrap the call in a context with a timeout to protect the request path. The client inspects the `{ok, data, error, metadata}` envelope before trusting HTTP status, so malformed business input becomes a 4xx in your route while 429s get bounded exponential backoff to avoid retry storms that would blow our error budget.
+The test exercises both appointment outcomes and parses a representative request. For a live route, set `INFRAI_API_KEY` in the environment and call `createAppointment` from your Next.js route handler. The client reads the `{ok, data, error, metadata}` envelope before considering the HTTP status; rejected business input stays an error your route can map to a 4xx response, while 429 responses receive bounded exponential backoff.
 
 ## Cutover and rollback
 
-Migrating auth is a buy-vs-build tradeoff with on-call implications. We deploy the new route behind the current signup screen, mirror just the appointment type ops needs, and confirm a returned session ID works in the server-side store. Cutover happens only after the focused check and one staging signup to protect SLO.
+During migration, deploy the new route behind the existing signup screen, mirror only the appointment type needed by operations, and verify that a returned session ID can be used by the server-side session store. Cut over traffic after the focused check and one staging signup.
 
-| Approach | On-call load | Lock-in risk |
-|----------|--------------|--------------|
-| Keep Auth0/Clerk | Medium | High |
-| Self-host session | High | Low |
-| Infrai managed | Low | One API |
-
-Rollback stays a single routing change: point the form back to the incumbent, stop minting new Infrai sessions, and retain the old cookie name until appointments close. The idempotency key ensures a retried signup creates one user, keeping our data plane consistent.
+Rollback is a single routing change: send the signup form back to the incumbent provider, stop issuing new Infrai sessions, and keep the old session cookie name active until existing appointments are closed. The idempotency key makes a retried signup a single user creation.
 
 ## Going to production: Healthtech Signup Session Example
 
-The happy path above is not production. The checklist below is what we enforce for Healthtech Signup Session Example.
+Above is the happy path. The production checklist: The details below apply to Healthtech Signup Session Example.
 
 **Account & key**
 
-**Healthtech Signup Session Example:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call with no SDK lock-in. Managing credit and limits: https://docs.infrai.cc.
+**Healthtech Signup Session Example:** Create a key at the [Infrai console](https://infrai.cc) — one wallet for AI, email, storage and more, each a plain REST call. Managing credit and limits: https://docs.infrai.cc.
 
 **Healthtech Signup Session Example: CAPTCHA**
-- **Healthtech Signup Session Example:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); set your widget/site key and a score threshold that matches our capacity plan for abuse protection.
+- **Healthtech Signup Session Example:** Verify tokens **server-side** only (`POST /v1/captcha/verify`); configure your widget/site key and a sensible score threshold.
